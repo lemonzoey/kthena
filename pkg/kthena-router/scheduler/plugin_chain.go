@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +31,7 @@ import (
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins"
 )
@@ -57,14 +59,32 @@ type PluginChain struct {
 	closeOnce sync.Once
 }
 
+// profileLabel returns the metric label for this chain's profile, or "" for
+// the global chain. The global chain has no profile: it is built once at
+// startup and never rebuilt, so it has no resolution or lifecycle to report.
+func (c *PluginChain) profileLabel() string {
+	if c.profile.Name == "" {
+		return ""
+	}
+	return c.profile.String()
+}
+
 // Acquire marks a request as using the chain; pair it with Release.
-func (c *PluginChain) Acquire() { c.inflight.Add(1) }
+func (c *PluginChain) Acquire() {
+	c.inflight.Add(1)
+	if label := c.profileLabel(); label != "" {
+		metrics.DefaultMetrics.SetSchedulerProfileChainInflight(label, c.inflight.Load())
+	}
+}
 
 // Release marks a request done; the last release on a retired chain
 // triggers the close.
 func (c *PluginChain) Release() {
 	if c.inflight.Add(-1) < 0 {
 		c.inflight.Store(0)
+	}
+	if label := c.profileLabel(); label != "" {
+		metrics.DefaultMetrics.SetSchedulerProfileChainInflight(label, c.inflight.Load())
 	}
 	c.tryClose()
 }
@@ -74,6 +94,9 @@ func (c *PluginChain) Release() {
 // (or on a chain never published to the map).
 func (c *PluginChain) retire() {
 	c.retired.Store(true)
+	if label := c.profileLabel(); label != "" {
+		metrics.DefaultMetrics.IncSchedulerProfileChainRetired(label)
+	}
 	klog.V(2).Infof("SchedulerProfile %s: plugin chain retired with %d in-flight requests; close deferred until drain",
 		c.profile.String(), c.inflight.Load())
 	c.tryClose()
@@ -305,6 +328,10 @@ func (m *ProfileChainManager) reconcileProfile(key types.NamespacedName, profile
 			old.retire()
 		}
 		m.mu.Unlock()
+		// The profile no longer serves: drop its instantaneous gauges so a
+		// deleted or unreferenced profile does not leave a stale "resolved" or
+		// "in-flight" series behind.
+		metrics.DefaultMetrics.ClearSchedulerProfile(key.String())
 		if hadChain || hadErr {
 			m.notifyStatusNotify(key)
 		}
@@ -358,10 +385,17 @@ func (m *ProfileChainManager) reconcileProfile(key types.NamespacedName, profile
 	m.mu.Unlock()
 
 	if err != nil {
+		// The profile's current spec is not serving: either no chain was ever
+		// built, or a previous one keeps serving while this rebuild failed. The
+		// gauge reports "not resolved" in both cases, matching the
+		// SchedulerProfileResolved condition.
+		metrics.DefaultMetrics.SetSchedulerProfileResolved(key.String(), false)
+		metrics.DefaultMetrics.IncSchedulerProfileBuildError(key.String())
 		klog.Warningf("SchedulerProfile %s: failed to build plugin chain: %v", key.String(), err)
 		m.notifyStatusNotify(key)
 		return
 	}
+	metrics.DefaultMetrics.SetSchedulerProfileResolved(key.String(), true)
 	klog.Infof("SchedulerProfile %s: chain built (filters: [%s], scores: [%s])",
 		key.String(), pluginNames(chain.filters), scorePluginNames(chain.scores))
 	m.notifyStatusNotify(key)
@@ -373,6 +407,16 @@ func (m *ProfileChainManager) reconcileProfile(key types.NamespacedName, profile
 // while the webhook was down. On failure, already-constructed plugin
 // instances are closed so a rejected profile leaks nothing.
 func (m *ProfileChainManager) buildChain(profile *aiv1alpha1.SchedulerProfile) (chain *PluginChain, buildErr error) {
+	start := time.Now()
+	// Record every build attempt, including ones discarded as stale: chain
+	// build cost is what a profile update pays, regardless of which build wins.
+	defer func() {
+		metrics.DefaultMetrics.RecordSchedulerProfileBuildDuration(
+			types.NamespacedName{Namespace: profile.Namespace, Name: profile.Name}.String(),
+			time.Since(start),
+		)
+	}()
+
 	var filters []framework.FilterPlugin
 	var scores []*scorePlugin
 	bc := plugins.BuildContext{Profile: types.NamespacedName{Namespace: profile.Namespace, Name: profile.Name}}
@@ -460,7 +504,7 @@ func (m *ProfileChainManager) buildChain(profile *aiv1alpha1.SchedulerProfile) (
 // retire path uses), so an already-retired chain is never handed out. The
 // chain may still be retired later while in use; Release keeps it open until
 // this request is done. A ModelServer without a reference returns (nil, nil).
-func (m *ProfileChainManager) AcquireProfile(ms *aiv1alpha1.ModelServer) (*PluginChain, error) {
+func (m *ProfileChainManager) AcquireProfile(ms *aiv1alpha1.ModelServer) (chain *PluginChain, err error) {
 	if ms == nil || ms.Spec.TrafficPolicy == nil ||
 		ms.Spec.TrafficPolicy.LoadBalancer == nil ||
 		ms.Spec.TrafficPolicy.LoadBalancer.SchedulerProfile == nil {
@@ -468,14 +512,22 @@ func (m *ProfileChainManager) AcquireProfile(ms *aiv1alpha1.ModelServer) (*Plugi
 	}
 	name := *ms.Spec.TrafficPolicy.LoadBalancer.SchedulerProfile
 	key := types.NamespacedName{Namespace: ms.Namespace, Name: name}
-	if chain, err := m.acquireCachedProfile(key); chain != nil || err != nil {
+	// Count every request that gets a chain, on both the cached and the
+	// synchronous-build path.
+	defer func() {
+		if chain != nil {
+			metrics.DefaultMetrics.IncSchedulerProfileRequest(key.String(), modelServerModel(ms))
+		}
+	}()
+
+	if chain, err = m.acquireCachedProfile(key); chain != nil || err != nil {
 		return chain, err
 	}
 
 	// Store callbacks are asynchronous. Build synchronously on a referenced
 	// cache miss so the first request need not wait for callback scheduling.
 	m.reconcileProfile(key, false)
-	if chain, err := m.acquireCachedProfile(key); chain != nil || err != nil {
+	if chain, err = m.acquireCachedProfile(key); chain != nil || err != nil {
 		return chain, err
 	}
 	return nil, fmt.Errorf("SchedulerProfile %q not found in namespace %q", name, ms.Namespace)
@@ -495,4 +547,14 @@ func (m *ProfileChainManager) acquireCachedProfile(key types.NamespacedName) (*P
 		return nil, fmt.Errorf("SchedulerProfile %q failed to build: %w", key.String(), buildErr)
 	}
 	return nil, nil
+}
+
+// modelServerModel returns the label value for the request metric. It prefers
+// the served model name and falls back to the ModelServer name when the model
+// field is unset.
+func modelServerModel(ms *aiv1alpha1.ModelServer) string {
+	if ms.Spec.Model != nil && *ms.Spec.Model != "" {
+		return *ms.Spec.Model
+	}
+	return ms.Name
 }

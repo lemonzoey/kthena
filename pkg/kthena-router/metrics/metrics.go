@@ -43,6 +43,7 @@ const (
 	LabelEngine        = "engine"
 	LabelUserID        = "user_id"
 	LabelStage         = "stage"
+	LabelProfile       = "scheduler_profile"
 
 	UnknownModel            = "unknown"
 	UnknownPath             = "other"
@@ -143,6 +144,15 @@ type Metrics struct {
 	SessionBoostQueueCancelledTotal prometheus.CounterVec
 	SessionBoostQueueDequeueTotal   prometheus.CounterVec
 	SessionBoostQueueInflight       prometheus.GaugeVec
+
+	// SchedulerProfile chain metrics. One plugin chain is built per profile, so
+	// these are keyed by the profile's namespaced name.
+	SchedulerProfileResolved          prometheus.GaugeVec
+	SchedulerProfileBuildDuration     prometheus.HistogramVec
+	SchedulerProfileBuildErrorsTotal  prometheus.CounterVec
+	SchedulerProfileChainInflight     prometheus.GaugeVec
+	SchedulerProfileChainRetiredTotal prometheus.CounterVec
+	SchedulerProfileRequestsTotal     prometheus.CounterVec
 }
 
 // NewMetrics creates a new Metrics instance with all Prometheus metrics registered
@@ -381,6 +391,55 @@ func NewMetrics() *Metrics {
 			},
 			[]string{LabelModel},
 		),
+
+		SchedulerProfileResolved: *promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kthena_router_scheduler_profile_resolved",
+				Help: "Whether the SchedulerProfile's plugin chain is currently resolved and serving requests (1) or not (0)",
+			},
+			[]string{LabelProfile},
+		),
+
+		SchedulerProfileBuildDuration: *promauto.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "kthena_router_scheduler_profile_build_duration_seconds",
+				Help:    "Time spent building a SchedulerProfile's plugin chain",
+				Buckets: []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1},
+			},
+			[]string{LabelProfile},
+		),
+
+		SchedulerProfileBuildErrorsTotal: *promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kthena_router_scheduler_profile_build_errors_total",
+				Help: "Number of failed SchedulerProfile plugin chain builds",
+			},
+			[]string{LabelProfile},
+		),
+
+		SchedulerProfileChainInflight: *promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kthena_router_scheduler_profile_chain_inflight",
+				Help: "Number of in-flight requests using a SchedulerProfile's plugin chain; a replaced or deleted chain closes only after this drains to zero",
+			},
+			[]string{LabelProfile},
+		),
+
+		SchedulerProfileChainRetiredTotal: *promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kthena_router_scheduler_profile_chain_retired_total",
+				Help: "Number of SchedulerProfile plugin chains retired after a profile update or deletion",
+			},
+			[]string{LabelProfile},
+		),
+
+		SchedulerProfileRequestsTotal: *promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kthena_router_scheduler_profile_requests_total",
+				Help: "Number of requests scheduled with a SchedulerProfile's plugin chain",
+			},
+			[]string{LabelProfile, LabelModel},
+		),
 	}
 
 	m.ActiveRequests = promauto.NewGaugeFunc(
@@ -462,6 +521,47 @@ func (m *Metrics) RecordKVCacheTokenizeDuration(model string, duration time.Dura
 
 func (m *Metrics) RecordKVCacheError(model, stage string) {
 	m.KVCacheErrorsTotal.WithLabelValues(model, stage).Inc()
+}
+
+// SetSchedulerProfileResolved reports whether the profile currently has a
+// serving plugin chain. A profile that failed to build reports 0; a profile
+// whose rebuild failed while the previous chain serves also reports 0 so the
+// condition and the metric agree.
+func (m *Metrics) SetSchedulerProfileResolved(profile string, resolved bool) {
+	v := 0.0
+	if resolved {
+		v = 1.0
+	}
+	m.SchedulerProfileResolved.WithLabelValues(profile).Set(v)
+}
+
+func (m *Metrics) RecordSchedulerProfileBuildDuration(profile string, duration time.Duration) {
+	m.SchedulerProfileBuildDuration.WithLabelValues(profile).Observe(duration.Seconds())
+}
+
+func (m *Metrics) IncSchedulerProfileBuildError(profile string) {
+	m.SchedulerProfileBuildErrorsTotal.WithLabelValues(profile).Inc()
+}
+
+func (m *Metrics) SetSchedulerProfileChainInflight(profile string, count int64) {
+	m.SchedulerProfileChainInflight.WithLabelValues(profile).Set(float64(count))
+}
+
+func (m *Metrics) IncSchedulerProfileChainRetired(profile string) {
+	m.SchedulerProfileChainRetiredTotal.WithLabelValues(profile).Inc()
+}
+
+func (m *Metrics) IncSchedulerProfileRequest(profile, model string) {
+	m.SchedulerProfileRequestsTotal.WithLabelValues(profile, model).Inc()
+}
+
+// ClearSchedulerProfile drops the profile's instantaneous gauges so a deleted
+// profile does not leave a stale "resolved" or "in-flight" series behind. The
+// cumulative counters are kept: they describe what happened while the profile
+// existed.
+func (m *Metrics) ClearSchedulerProfile(profile string) {
+	m.SchedulerProfileResolved.DeleteLabelValues(profile)
+	m.SchedulerProfileChainInflight.DeleteLabelValues(profile)
 }
 
 // RecordRequest records a completed request with all relevant metrics

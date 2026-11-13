@@ -385,3 +385,84 @@ func TestActiveUpstreamRequestsKeepModelServerCompatibilityLabel(t *testing.T) {
 		t.Errorf("external active upstream delta after decrement = %v, want 0", got)
 	}
 }
+
+func TestSchedulerProfileMetrics(t *testing.T) {
+	m := DefaultMetrics
+	const profile = "default/metricstest-profile"
+
+	// Resolution gauge reflects both states.
+	m.SetSchedulerProfileResolved(profile, true)
+	if got := gaugeVal(t, &m.SchedulerProfileResolved, profile); got != 1 {
+		t.Errorf("resolved gauge = %v, want 1", got)
+	}
+	m.SetSchedulerProfileResolved(profile, false)
+	if got := gaugeVal(t, &m.SchedulerProfileResolved, profile); got != 0 {
+		t.Errorf("resolved gauge after failure = %v, want 0", got)
+	}
+
+	// Build duration is observed once per attempt.
+	beforeCount := histCount(t, &m.SchedulerProfileBuildDuration, profile)
+	beforeSum := histSum(t, &m.SchedulerProfileBuildDuration, profile)
+	m.RecordSchedulerProfileBuildDuration(profile, 10*time.Millisecond)
+	m.RecordSchedulerProfileBuildDuration(profile, 30*time.Millisecond)
+	if got := histCount(t, &m.SchedulerProfileBuildDuration, profile) - beforeCount; got != 2 {
+		t.Errorf("build duration sample count delta = %v, want 2", got)
+	}
+	if got := histSum(t, &m.SchedulerProfileBuildDuration, profile) - beforeSum; got < 0.039 || got > 0.041 {
+		t.Errorf("build duration sum delta = %v, want ~0.04", got)
+	}
+
+	// Build errors accumulate per profile.
+	beforeErr := counterVal(t, &m.SchedulerProfileBuildErrorsTotal, profile)
+	m.IncSchedulerProfileBuildError(profile)
+	m.IncSchedulerProfileBuildError(profile)
+	if got := counterVal(t, &m.SchedulerProfileBuildErrorsTotal, profile) - beforeErr; got != 2 {
+		t.Errorf("build error delta = %v, want 2", got)
+	}
+
+	// In-flight gauge tracks the current count, not a cumulative one.
+	m.SetSchedulerProfileChainInflight(profile, 3)
+	if got := gaugeVal(t, &m.SchedulerProfileChainInflight, profile); got != 3 {
+		t.Errorf("chain inflight = %v, want 3", got)
+	}
+	m.SetSchedulerProfileChainInflight(profile, 0)
+	if got := gaugeVal(t, &m.SchedulerProfileChainInflight, profile); got != 0 {
+		t.Errorf("chain inflight after drain = %v, want 0", got)
+	}
+
+	// Retired counter and per-model request counter accumulate.
+	beforeRetired := counterVal(t, &m.SchedulerProfileChainRetiredTotal, profile)
+	m.IncSchedulerProfileChainRetired(profile)
+	if got := counterVal(t, &m.SchedulerProfileChainRetiredTotal, profile) - beforeRetired; got != 1 {
+		t.Errorf("retired delta = %v, want 1", got)
+	}
+	const model = "metrics-model"
+	beforeReq := counterVal(t, &m.SchedulerProfileRequestsTotal, profile, model)
+	m.IncSchedulerProfileRequest(profile, model)
+	if got := counterVal(t, &m.SchedulerProfileRequestsTotal, profile, model) - beforeReq; got != 1 {
+		t.Errorf("request delta = %v, want 1", got)
+	}
+}
+
+func TestClearSchedulerProfileDropsGaugesKeepsCounters(t *testing.T) {
+	m := DefaultMetrics
+	const profile = "default/metricstest-cleared-profile"
+
+	m.SetSchedulerProfileResolved(profile, true)
+	m.SetSchedulerProfileChainInflight(profile, 5)
+	m.IncSchedulerProfileBuildError(profile)
+
+	m.ClearSchedulerProfile(profile)
+
+	if got := gaugeVal(t, &m.SchedulerProfileResolved, profile); got != 0 {
+		t.Errorf("resolved gauge after clear = %v, want 0", got)
+	}
+	if got := gaugeVal(t, &m.SchedulerProfileChainInflight, profile); got != 0 {
+		t.Errorf("chain inflight after clear = %v, want 0", got)
+	}
+	// Cumulative counters describe what happened while the profile existed and
+	// must survive the deletion.
+	if got := counterVal(t, &m.SchedulerProfileBuildErrorsTotal, profile); got < 1 {
+		t.Errorf("build error counter after clear = %v, want >= 1", got)
+	}
+}
